@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OG Expedition Position Tracker
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0-rc1
+// @version      1.0.0-rc2
 // @description  Tracks visited expedition positions (galaxy:system) per server day and suggests the n closest unvisited systems in the fleet dispatch view. n is bound to your Astrophysics expedition slots.
 // @author       Wired
 // @license      MIT
@@ -14,10 +14,11 @@
     'use strict';
 
     // ------------------------- Configuration -------------------------
-    const STORAGE_KEY   = 'expeditionVisited';   // { updDate: 'YYYY-MM-DD', visited: ['g:s', ...] }
+    const STORAGE_KEY   = 'expeditionVisited';   // { updDate: 'YYYY-MM-DD', visited: ['g:s:visitedCount', ...] }
     const MAX_SYSTEM    = 499;                   // systems per galaxy on your universe
     const DONUT_SYSTEM  = true;                  // circular system distance (donut universe)
     const DEFAULT_N     = 4;                     // fallback ONLY if slot detection fails
+    const MAX_VISITS    = 10;                    // maximum visits allowed before position exhaustion
 
     // ------------------------- Date helpers --------------------------
     // Aligned with OGame SERVER time, read from the page's own meta tags:
@@ -64,10 +65,22 @@
     }
 
     // ------------------------- Storage -------------------------------
+    // visited is an array of 'g:s:visitedCount' strings, e.g. '5:244:3'.
+    // Legacy 'g:s' entries (no count) are accepted and mean count = 1.
     function loadStore() {
         let store = GM_getValue(STORAGE_KEY, null);
         if (typeof store === 'string') {
             try { store = JSON.parse(store); } catch (e) { store = null; }
+        }
+        // Migration from the interim dict format:
+        // { 'g:s': { count, last } }  ->  ['g:s:count', ...]
+        if (store && store.visited && !Array.isArray(store.visited) &&
+            typeof store.visited === 'object') {
+            store.visited = Object.keys(store.visited).map((key) => {
+                const c = (store.visited[key] && store.visited[key].count) || 1;
+                return `${key}:${c}`;
+            });
+            saveStore(store);
         }
         if (!store || !store.updDate || !Array.isArray(store.visited)) {
             store = { updDate: currDate(), visited: [] };
@@ -132,15 +145,63 @@
 
     function markVisited(galaxy, system) {
         const store = loadStore(); // loadStore handles the daily reset
-        const key = `${galaxy}:${system}`;
-        if (!store.visited.includes(key)) {
-            store.visited.push(key);
-            saveStore(store);
+        // Entries are stored as "g:s:visitedCount" strings, e.g. "5:244:3".
+        // Anchored regex: matches this exact g:s, with an optional ":count"
+        // suffix captured in group 1. The anchors matter: without them,
+        // "5:24" would also match "5:244".
+        const re = new RegExp(`^${galaxy}:${system}(?::(\\d+))?$`);
+
+        // Regex-based replacement for the old `store.visited.includes(key)`:
+        const idx = store.visited.findIndex(entry => re.test(entry));
+
+        if (idx === -1) {
+            // Not visited yet today: create the entry with count = 1.
+            store.visited.push(`${galaxy}:${system}:1`);
+        } else {
+            // Already visited: parse the current count and add +1.
+            // A legacy entry without a count suffix ("g:s") counts as 1.
+            const m = re.exec(store.visited[idx]);
+            const count = (m && m[1] ? parseInt(m[1], 10) : 1) + 1;
+            store.visited[idx] = `${galaxy}:${system}:${count}`;
         }
+        saveStore(store);
     }
 
     function isVisited(store, galaxy, system) {
-        return store.visited.includes(`${galaxy}:${system}`);
+        // Matches both the legacy format "g:s" and the new "g:s:visitedCount".
+        const re = new RegExp(`^${galaxy}:${system}(?::\\d+)?$`);
+        return store.visited.some(entry => re.test(entry));
+    }
+
+    function getVisitCount(store, galaxy, system) { // -> 0 if never visited today
+        const re = new RegExp(`^${galaxy}:${system}(?::(\\d+))?$`);
+        for (const entry of store.visited) {
+            const m = re.exec(entry);
+            if (m) return m[1] ? parseInt(m[1], 10) : 1; // legacy "g:s" counts as 1
+        }
+        return 0;
+    }
+
+    // All positions visited today in this galaxy, sorted by distance
+    // from `fromSystem`, with their visit count.
+    function visitedInGalaxy(galaxy, fromSystem) {
+        const store = loadStore();
+        const entryRe = /^(\d+):(\d+)(?::(\d+))?$/; // g : s : optional count
+        const results = [];
+        for (const entry of store.visited) {
+            const m = entryRe.exec(entry);
+            if (!m) continue;
+            const kg = parseInt(m[1], 10);
+            const ks = parseInt(m[2], 10);
+            if (kg !== galaxy || !Number.isInteger(ks)) continue;
+            results.push({
+                system: ks,
+                dist: systemDistance(fromSystem, ks),
+                count: m[3] ? parseInt(m[3], 10) : 1,
+            });
+        }
+        results.sort((a, b) => a.dist - b.dist || a.system - b.system);
+        return results;
     }
 
     // ------------------------- Distance ------------------------------
@@ -249,7 +310,8 @@
             }
         }
 
-        const inGalaxy = store.visited.filter(v => v.startsWith(`${g}:`)).length;
+        const inGalaxy = store.visited
+            .filter(entry => entry.startsWith(`${g}:`)).length;
         const countEl = panel.querySelector('#expoTrackerVisitedCount');
         countEl.textContent = `Visited today in G${g}: ${inGalaxy} system(s) — resets at server midnight (${store.updDate})`;
         countEl.style.cssText = 'opacity:0.85;';
@@ -269,40 +331,78 @@
         const useStart = !!(start && start.g === g);
         const refSystem = useStart ? start.s : s;
 
-        const suggestions = closestUnvisited(g, refSystem, n);
-        if (suggestions.length === 0) {
-            box.textContent = 'No unvisited systems left in this galaxy today!';
-            return;
-        }
-
-        const label = document.createElement('div');
-        label.textContent = useStart
-            ? `Closest unvisited (d from start ${start.g}:${start.s}):`
-            : 'Closest unvisited (d from target — start position not detected):';
-        label.style.cssText = 'margin-top:4px;color:#fff;';
-        box.appendChild(label);
-
-        const chips = document.createElement('div');
-        chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:2px;';
-        box.appendChild(chips);
-
-        suggestions.forEach((sug) => {
+        // Shared chip factory. state: 'unvisited' (green, clickable),
+        // 'visited' (grayed out, still clickable), 'exhausted' (blacked
+        // out, count > MAX_VISITS, NOT clickable).
+        const CHIP_STYLES = {
+            unvisited: 'border:1px solid #3f6f3f;background:rgba(0,40,0,0.4);color:#7fd17f;cursor:pointer;',
+            visited:   'border:1px solid #555;background:rgba(70,70,70,0.35);color:#9a9a9a;cursor:pointer;opacity:0.75;',
+            exhausted: 'border:1px solid #222;background:rgba(0,0,0,0.85);color:#555;cursor:not-allowed;',
+        };
+        const makeChip = (system, text, title, state) => {
             const a = document.createElement('a');
             a.href = '#';
-            a.textContent = `${g}:${sug.system}:16 (d=${sug.dist})`;
-            a.style.cssText = [
-                'display:inline-block', 'padding:2px 7px',
-                'border:1px solid #3f6f3f', 'border-radius:3px',
-                'background:rgba(0,40,0,0.4)', 'color:#7fd17f',
-                'text-decoration:none', 'cursor:pointer', 'white-space:nowrap',
-            ].join(';');
-            a.title = 'Click to fill coordinates';
+            a.textContent = text;
+            a.style.cssText =
+                'display:inline-block;padding:2px 7px;border-radius:3px;' +
+                'text-decoration:none;white-space:nowrap;' + CHIP_STYLES[state];
+            a.title = title;
             a.addEventListener('click', (e) => {
                 e.preventDefault();
-                setCoords(g, sug.system, 16);
+                if (state === 'exhausted') return; // blacked out: not clickable
+                setCoords(g, system, 16);
             });
-            chips.appendChild(a);
-        });
+            return a;
+        };
+
+        const addSection = (labelText) => {
+            const label = document.createElement('div');
+            label.textContent = labelText;
+            label.style.cssText = 'margin-top:4px;color:#fff;';
+            box.appendChild(label);
+            const chips = document.createElement('div');
+            chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:2px;';
+            box.appendChild(chips);
+            return chips;
+        };
+
+        // --- unvisited suggestions (green) ---
+        const suggestions = closestUnvisited(g, refSystem, n);
+        if (suggestions.length === 0) {
+            const none = document.createElement('div');
+            none.textContent = 'No unvisited systems left in this galaxy today!';
+            box.appendChild(none);
+        } else {
+            const chips = addSection(useStart
+                ? `Closest unvisited (d from start ${start.g}:${start.s}):`
+                : 'Closest unvisited (d from target — start position not detected):');
+            suggestions.forEach((sug) => {
+                chips.appendChild(makeChip(
+                    sug.system,
+                    `${g}:${sug.system}:16 (d=${sug.dist})`,
+                    'Click to fill coordinates',
+                    'unvisited'
+                ));
+            });
+        }
+
+        // --- visited today: grayed out with (v: count); positions past
+        // --- MAX_VISITS are exhausted and blacked out (not clickable).
+        const visited = visitedInGalaxy(g, refSystem);
+        if (visited.length > 0) {
+            const chips = addSection(`Visited today (${visited.length}):`);
+            visited.forEach((v) => {
+                const exhausted = v.count > MAX_VISITS;
+                chips.appendChild(makeChip(
+                    v.system,
+                    `${g}:${v.system}:16 (d=${v.dist}, v: ${v.count})`,
+                    exhausted
+                        ? `Exhausted: visited ${v.count} times today (> ${MAX_VISITS})`
+                        : `Already visited ${v.count} time(s) today — click to fill anyway`,
+                    exhausted ? 'exhausted' : 'visited'
+                ));
+            });
+        }
     }
 
     function setCoords(g, s, p) {
@@ -566,4 +666,3 @@
 
     main();
 })();
-
