@@ -333,7 +333,7 @@
 
         // Shared chip factory. state: 'unvisited' (green, clickable),
         // 'visited' (grayed out, still clickable), 'exhausted' (blacked
-        // out, count > MAX_VISITS, NOT clickable).
+        // out, count >= MAX_VISITS, NOT clickable).
         const CHIP_STYLES = {
             unvisited: 'border:1px solid #3f6f3f;background:rgba(0,40,0,0.4);color:#7fd17f;cursor:pointer;',
             visited:   'border:1px solid #555;background:rgba(70,70,70,0.35);color:#9a9a9a;cursor:pointer;opacity:0.75;',
@@ -392,12 +392,12 @@
         if (visited.length > 0) {
             const chips = addSection(`Visited today (${visited.length}):`);
             visited.forEach((v) => {
-                const exhausted = v.count > MAX_VISITS;
+                const exhausted = v.count >= MAX_VISITS;
                 chips.appendChild(makeChip(
                     v.system,
                     `${g}:${v.system}:16 (d=${v.dist}, v: ${v.count})`,
                     exhausted
-                        ? `Exhausted: visited ${v.count} times today (> ${MAX_VISITS})`
+                        ? `Exhausted: visited ${v.count} times today (>= ${MAX_VISITS})`
                         : `Already visited ${v.count} time(s) today — click to fill anyway`,
                     exhausted ? 'exhausted' : 'visited'
                 ));
